@@ -2,7 +2,7 @@ const UUID = '183e65b1-169a-4131-a1ce-d60d7ffe3c93';
 const UUID_BYTES = new Uint8Array(UUID.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16)));
 
 export default {
-  async fetch(req) {
+  async fetch(req, env) {
     if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const [client, ws] = Object.values(new WebSocketPair());
       ws.accept();
@@ -14,30 +14,24 @@ export default {
       ws.binaryType = 'arraybuffer';
 
       const u = new URL(req.url);
-
-      if (u.pathname.includes('%3F')) {
-        const decoded = decodeURIComponent(u.pathname);
-        const queryIndex = decoded.indexOf('?');
-        if (queryIndex !== -1) {
-          u.search = decoded.substring(queryIndex);
-          u.pathname = decoded.substring(0, queryIndex);
-        }
-      }
-
       const mode = u.searchParams.get('mode') || 'auto';
-      const s5Param = u.searchParams.get('s5');
-      const proxyParam = u.searchParams.get('proxyip');
-      const httpParam = u.searchParams.get('http');
-      const path = s5Param ? s5Param : u.pathname.slice(1);
+
+      const rawS5Param = u.searchParams.get('s5');
+      const rawProxyParam = u.searchParams.get('proxyip');
+      const rawHttpParam = u.searchParams.get('http');
+
+      const s5Param = rawS5Param ? decodeURIComponent(rawS5Param) : null;
+      const proxyParam = rawProxyParam ? decodeURIComponent(rawProxyParam) : null;
+      const httpParam = rawHttpParam ? decodeURIComponent(rawHttpParam) : null;
+      const path = s5Param ? s5Param : decodeURIComponent(u.pathname).slice(1);
 
       const socks5 = path.includes('@') ? (() => {
         const [cred, server] = path.split('@');
         const [user, pass] = cred.split(':');
-        const [host, port = 1080] = server.split(':');
+        const [host, port = 443] = server.split(':');
         return { user, pass, host, port: +port };
       })() : null;
-
-      const PROXY_IP = proxyParam || null;
+      const PROXY_IP = proxyParam ? String(proxyParam) : null;
 
       const httpProxy = httpParam ? (() => {
         const atIndex = httpParam.lastIndexOf('@');
@@ -56,7 +50,8 @@ export default {
         if (mode === 'proxy') return ['direct', 'proxy'];
         if (mode !== 'auto') return [mode];
         const order = [];
-        for (const pair of u.search.slice(1).split('&')) {
+        const searchStr = u.search.slice(1);
+        for (const pair of searchStr.split('&')) {
           const key = pair.split('=')[0];
           if (key === 'direct') order.push('direct');
           else if (key === 's5') order.push('s5');
@@ -68,21 +63,13 @@ export default {
 
       let remote = null, udpWriter = null, isDNS = false;
 
-      const cleanup = () => {
-        try { remote?.close(); } catch {}
-        remote = null;
-        try { udpWriter?.releaseLock(); } catch {}
-        udpWriter = null;
-        isDNS = false;
-      };
-
       const socks5Connect = async (targetHost, targetPort) => {
         const sock = req.fetcher.connect({ hostname: socks5.host, port: socks5.port });
         await sock.opened;
         const w = sock.writable.getWriter();
         const r = sock.readable.getReader();
         await w.write(new Uint8Array([5, 2, 0, 2]));
-        const { value: auth } = await r.read();
+        const auth = (await r.read()).value;
         if (auth[1] === 2 && socks5.user) {
           const user = new TextEncoder().encode(socks5.user);
           const pass = new TextEncoder().encode(socks5.pass);
@@ -108,11 +95,10 @@ export default {
         w.releaseLock();
         const r = sock.readable.getReader();
         let resp = '';
-        const decoder = new TextDecoder();
         while (true) {
           const { value, done } = await r.read();
           if (done) throw new Error();
-          resp += decoder.decode(value, { stream: true });
+          resp += new TextDecoder().decode(value);
           if (resp.includes('\r\n\r\n')) break;
         }
         r.releaseLock();
@@ -121,17 +107,27 @@ export default {
 
       new ReadableStream({
         start(ctrl) {
+          ws.addEventListener('message', e => ctrl.enqueue(e.data));
+          ws.addEventListener('close', () => {
+            remote?.close();
+            ctrl.close();
+          });
+          ws.addEventListener('error', () => {
+            remote?.close();
+            ctrl.error();
+          });
+
           const early = req.headers.get('sec-websocket-protocol');
           if (early) {
             try {
-              ctrl.enqueue(Uint8Array.from(atob(early.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)).buffer);
+              ctrl.enqueue(
+                Uint8Array.from(
+                  atob(early.replace(/-/g, '+').replace(/_/g, '/')),
+                  c => c.charCodeAt(0)
+                ).buffer
+              );
             } catch {}
           }
-          ws.addEventListener('message', e => ctrl.enqueue(e.data));
-          ws.addEventListener('close', () => {
-            setTimeout(() => { if (ws.readyState !== 1) { cleanup(); ctrl.close(); } }, 500);
-          });
-          ws.addEventListener('error', () => { cleanup(); ctrl.error(); });
         }
       }).pipeTo(new WritableStream({
         async write(data) {
@@ -144,8 +140,11 @@ export default {
           }
 
           if (data.byteLength < 24) return;
+
           const uuidBytes = new Uint8Array(data.slice(1, 17));
-          for (let i = 0; i < 16; i++) if (uuidBytes[i] !== UUID_BYTES[i]) return;
+          for (let i = 0; i < 16; i++) {
+            if (uuidBytes[i] !== UUID_BYTES[i]) return;
+          }
 
           const view = new DataView(data);
           const optLen = view.getUint8(17);
@@ -187,10 +186,11 @@ export default {
                 }
               }
             });
+
             readable.pipeTo(new WritableStream({
               async write(query) {
                 try {
-                  const resp = await req.fetcher.fetch('https://cloudflare-dns.com/dns-query', {
+                  const resp = await req.fetcher.fetch('https://1.1.1.1/dns-query', {
                     method: 'POST',
                     headers: { 'content-type': 'application/dns-message' },
                     body: query
@@ -214,16 +214,13 @@ export default {
                 sock = req.fetcher.connect({ hostname: addr, port });
                 await sock.opened;
                 break;
-              } else if (method === 's5') {
-                if (!socks5) continue;
+              } else if (method === 's5' && socks5) {
                 sock = await socks5Connect(addr, port);
                 break;
-              } else if (method === 'http') {
-                if (!httpProxy) continue;
+              } else if (method === 'http' && httpProxy) {
                 sock = await httpConnect(addr, port);
                 break;
-              } else if (method === 'proxy') {
-                if (!PROXY_IP) continue;
+              } else if (method === 'proxy' && PROXY_IP) {
                 const [ph, pp = port] = PROXY_IP.split(':');
                 sock = req.fetcher.connect({ hostname: ph, port: +pp || port });
                 await sock.opened;
@@ -233,6 +230,7 @@ export default {
           }
 
           if (!sock) return;
+
           remote = sock;
           const w = sock.writable.getWriter();
           await w.write(payload);
@@ -246,9 +244,9 @@ export default {
                 sent = true;
               }
             },
-            close: () => { cleanup(); if (ws.readyState === 1) ws.close(); },
-            abort: () => { cleanup(); if (ws.readyState === 1) ws.close(); }
-          })).catch(() => { cleanup(); });
+            close: () => ws.readyState === 1 && ws.close(),
+            abort: () => ws.readyState === 1 && ws.close()
+          })).catch(() => {});
         }
       })).catch(() => {});
 
