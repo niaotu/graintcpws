@@ -1,0 +1,14 @@
+name = "graintcpws"
+main = "dist/_worker.js"
+compatibility_date = "2026-05-01"
+workers_dev = false
+compatibility_flags = [
+  "fetch_treats_unknown_protocols_as_http",
+  "nodejs_compat",
+  "nodejs_compat_populate_process_env",
+  "web_socket_manual_reply_to_close"
+]
+
+
+
+
